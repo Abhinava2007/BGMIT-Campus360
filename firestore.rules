@@ -1,0 +1,152 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all unknown paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isUser(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function userRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && userRole() == 'super_admin';
+    }
+
+    function isHOD() {
+      return isSignedIn() && (userRole() == 'hod' || userRole() == 'super_admin');
+    }
+
+    function isStaff() {
+      return isSignedIn() && (
+        userRole() == 'faculty' ||
+        userRole() == 'hod' ||
+        userRole() == 'super_admin' ||
+        userRole() == 'election_officer' ||
+        userRole() == 'sports_coordinator'
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Institutions Configuration
+    match /institution/{configId} {
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin() || (
+        isHOD() && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role'])
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    // Tasks & Responsibilities
+    match /tasks/{taskId} {
+      allow read: if isSignedIn();
+      allow create: if isStaff() || userRole() == 'coordinator';
+      allow update: if isStaff() || (
+        isSignedIn() &&
+        resource.data.assigneeId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'submission', 'activityHistory'])
+      );
+      allow delete: if isHOD();
+    }
+
+    // Council Elections
+    match /elections/{electionId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isSignedIn() && (userRole() == 'election_officer' || isSuperAdmin());
+    }
+
+    // Voter Records (One participation record per voter per election)
+    match /voterRecords/{recordId} {
+      allow read: if isSuperAdmin() || userRole() == 'election_officer';
+      // Server-side or restricted write ensuring user logs own participation
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false; // Immutable once cast
+    }
+
+    // Secret Ballots (Decoupled, zero user identification stored)
+    match /secretBallots/{ballotId} {
+      allow read: if false; // Kept strictly private, results exposed via aggregate tally
+      allow create: if isSignedIn() && !('userId' in request.resource.data);
+      allow update, delete: if false; // Immutable
+    }
+
+    // Student Complaints & Grievances
+    match /complaints/{complaintId} {
+      // Submitter can read, or staff can read
+      allow read: if isSignedIn() && (
+        resource.data.submitterId == request.auth.uid ||
+        isStaff()
+      );
+      allow create: if isSignedIn() && request.resource.data.submitterId == request.auth.uid;
+      allow update: if isStaff() || (
+        isSignedIn() &&
+        resource.data.submitterId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['responses', 'updatedAt'])
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    // Requests (Leaves & Permissions)
+    match /requests/{requestId} {
+      allow read: if isSignedIn() && (
+        resource.data.submitterId == request.auth.uid ||
+        isStaff()
+      );
+      allow create: if isSignedIn() && request.resource.data.submitterId == request.auth.uid;
+      allow update: if isStaff() && resource.data.submitterId != request.auth.uid; // Prevent self-approval
+      allow delete: if isSuperAdmin();
+    }
+
+    // Campus & Sports Events
+    match /events/{eventId} {
+      allow read: if isSignedIn();
+      allow create, delete: if isSignedIn() && (
+        userRole() == 'sports_coordinator' ||
+        userRole() == 'coordinator' ||
+        isStaff()
+      );
+      allow update: if isSignedIn(); // For participant registration & volunteer duty claim
+    }
+
+    // Notices & Bulletins
+    match /notices/{noticeId} {
+      allow read: if isSignedIn();
+      allow create, update: if isStaff() || userRole() == 'coordinator';
+      allow delete: if isHOD();
+    }
+
+    // Governance Rules
+    match /rules/{ruleId} {
+      allow read: if isSignedIn();
+      allow write: if isHOD();
+    }
+
+    // Audit Logs
+    match /auditLogs/{logId} {
+      allow read: if isHOD();
+      allow create: if isSignedIn();
+      allow update, delete: if false; // Append-only audit trail
+    }
+  }
+}
